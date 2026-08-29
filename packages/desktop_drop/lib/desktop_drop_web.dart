@@ -100,11 +100,22 @@ class DesktopDropWeb {
 
       final items = event.dataTransfer!.items;
 
-      Future.wait(List.generate(items.length, (index) {
+      // A drag carries more than the files themselves: sources such as GTK
+      // file managers add `text/uri-list` and `text/plain` string items
+      // alongside them. `webkitGetAsEntry()` is null for every item whose
+      // `kind` is not 'file', so mapping the whole list and force-unwrapping
+      // threw before the drop could be delivered — synchronously, outside the
+      // `catchError` below — and the drop was silently lost.
+      final entries = <web.FileSystemEntry>[];
+      for (var index = 0; index < items.length; index++) {
         final item = items[index];
-        final entry = item.webkitGetAsEntry()!;
-        return _entryToWebDropItem(entry);
-      })).then((webItems) {
+        if (item.kind != 'file') continue;
+        final entry = item.webkitGetAsEntry();
+        if (entry == null) continue;
+        entries.add(entry);
+      }
+
+      Future.wait(entries.map(_entryToWebDropItem)).then((webItems) {
         channel.invokeMethod(
           "performOperation_web",
           webItems.map((e) => e.toJson()).toList(),
