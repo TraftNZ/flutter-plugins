@@ -18,17 +18,33 @@ private func findFlutterViewController(_ viewController: NSViewController?) -> F
 }
 
 public class DesktopDropPlugin: NSObject, FlutterPlugin {
+  private let messenger: FlutterBinaryMessenger
+
+  /// Windows attached with attachView, by Flutter view id. A target goes
+  /// away with its window.
+  private var viewTargets: [Int64: WeakDropTarget] = [:]
+
+  init(messenger: FlutterBinaryMessenger) {
+    self.messenger = messenger
+  }
+
   public static func register(with registrar: FlutterPluginRegistrar) {
-    guard let flutterView = registrar.view else { return }
-    guard let flutterWindow = flutterView.window else { return }
-    guard let vc = findFlutterViewController(flutterWindow.contentViewController) else { return }
-
     let channel = FlutterMethodChannel(name: "desktop_drop", binaryMessenger: registrar.messenger)
+    let instance = DesktopDropPlugin(messenger: registrar.messenger)
+    registrar.addMethodCallDelegate(instance, channel: channel)
 
-    let instance = DesktopDropPlugin()
-      
-      channel.setMethodCallHandler(instance.handle(_:result:))
-      
+    // A headless engine has no view; its app attaches windows with attachView.
+    guard let flutterView = registrar.view,
+      let flutterWindow = flutterView.window,
+      let vc = findFlutterViewController(flutterWindow.contentViewController)
+    else { return }
+    addDropTarget(to: vc, channel: channel)
+  }
+
+  @discardableResult
+  private static func addDropTarget(to vc: FlutterViewController, channel: FlutterMethodChannel)
+    -> DropTarget
+  {
     let d = DropTarget(frame: vc.view.bounds, channel: channel)
     d.autoresizingMask = [.width, .height]
 
@@ -39,11 +55,56 @@ public class DesktopDropPlugin: NSObject, FlutterPlugin {
     d.registerForDraggedTypes(types)
 
     vc.view.addSubview(d)
+    return d
+  }
 
-    registrar.addMethodCallDelegate(instance, channel: channel)
+  private func attachView(viewId: Int64, handle: Int64) -> Bool {
+    guard let pointer = UnsafeRawPointer(bitPattern: Int(handle)),
+      let window = Unmanaged<AnyObject>.fromOpaque(pointer).takeUnretainedValue() as? NSWindow,
+      let vc = findFlutterViewController(window.contentViewController)
+    else { return false }
+    detachView(viewId: viewId)
+    let channel = FlutterMethodChannel(
+      name: "desktop_drop/view/\(viewId)", binaryMessenger: messenger)
+    viewTargets[viewId] = WeakDropTarget(Self.addDropTarget(to: vc, channel: channel))
+    return true
+  }
+
+  private func detachView(viewId: Int64) {
+    viewTargets.removeValue(forKey: viewId)?.target?.removeFromSuperview()
+  }
+
+  private static func viewArguments(_ arguments: Any?) -> (viewId: Int64, handle: Int64?)? {
+    guard let map = arguments as? [String: Any],
+      let viewId = (map["viewId"] as? NSNumber)?.int64Value
+    else { return nil }
+    return (viewId, (map["handle"] as? NSNumber)?.int64Value)
   }
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult){
+
+      if call.method == "attachView" {
+        guard let args = Self.viewArguments(call.arguments), let handle = args.handle,
+          attachView(viewId: args.viewId, handle: handle)
+        else {
+          result(FlutterError(
+            code: "bad_args", message: "attachView needs an int viewId and an NSWindow handle",
+            details: nil))
+          return
+        }
+        result(nil)
+        return
+      }
+
+      if call.method == "detachView" {
+        guard let args = Self.viewArguments(call.arguments) else {
+          result(FlutterError(code: "bad_args", message: "detachView needs an int viewId", details: nil))
+          return
+        }
+        detachView(viewId: args.viewId)
+        result(nil)
+        return
+      }
  
       if call.method ==  "startAccessingSecurityScopedResource"{
             let map = call.arguments as! NSDictionary 
@@ -75,6 +136,14 @@ public class DesktopDropPlugin: NSObject, FlutterPlugin {
   }
 
    
+}
+
+private final class WeakDropTarget {
+  weak var target: DropTarget?
+
+  init(_ target: DropTarget) {
+    self.target = target
+  }
 }
 
 class DropTarget: NSView {

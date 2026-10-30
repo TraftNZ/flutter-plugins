@@ -11,6 +11,20 @@
 
 struct _DesktopDropPlugin {
   GObject parent_instance;
+
+  FlBinaryMessenger *messenger;
+
+  // Views attached with attachView, by Flutter view id: int64 -> ViewTarget.
+  GHashTable *view_targets;
+};
+
+// A window attached with attachView. Its events go to its own channel.
+struct ViewTarget {
+  DesktopDropPlugin *plugin;
+  gint64 view_id;
+  GtkWidget *view;
+  FlMethodChannel *channel;
+  gulong destroy_handler;
 };
 
 static gboolean isKDE = FALSE;
@@ -68,14 +82,151 @@ void on_drag_leave(GtkWidget *widget, GdkDragContext *drag_context, guint time, 
                                   nullptr, nullptr, nullptr);
 }
 
+static gboolean on_focus_in_event(GtkWidget *widget, GdkEventFocus *event,
+                                  gpointer user_data);
+
+// Makes [view] a drop target that reports to [channel].
+static void attach_drop_target(GtkWidget *view, FlMethodChannel *channel) {
+  // Register portal file transfer target FIRST (highest priority)
+  // then STRING, then URI targets
+  static GtkTargetEntry entries[] = {
+      {strdup("application/vnd.portal.filetransfer"), GTK_TARGET_OTHER_APP, 0},
+      {strdup("STRING"), GTK_TARGET_OTHER_APP, 0}
+  };
+  gtk_drag_dest_set(view, GTK_DEST_DEFAULT_ALL, entries, 2, GDK_ACTION_COPY);
+  gtk_drag_dest_add_uri_targets(view);
+
+  g_signal_connect(view, "drag-motion", G_CALLBACK(on_drag_motion), channel);
+  g_signal_connect(view, "drag-data-received",
+                   G_CALLBACK(on_drag_data_received), channel);
+  g_signal_connect(view, "drag-leave", G_CALLBACK(on_drag_leave), channel);
+  g_signal_connect(view, "focus-in-event", G_CALLBACK(on_focus_in_event),
+                   nullptr);
+}
+
+static void view_target_free(gpointer data) {
+  auto *target = static_cast<ViewTarget *>(data);
+  g_object_unref(target->channel);
+  g_free(target);
+}
+
+// The attached view is being destroyed with its window: forget it.
+static void on_view_destroy(GtkWidget *widget, gpointer user_data) {
+  auto *target = static_cast<ViewTarget *>(user_data);
+  g_hash_table_remove(target->plugin->view_targets, &target->view_id);
+}
+
+// Stops a view that stays open accepting drops.
+static void detach_view(DesktopDropPlugin *self, gint64 view_id) {
+  auto *target = static_cast<ViewTarget *>(
+      g_hash_table_lookup(self->view_targets, &view_id));
+  if (target == nullptr) {
+    return;
+  }
+  g_signal_handler_disconnect(target->view, target->destroy_handler);
+  g_signal_handlers_disconnect_by_data(target->view, target->channel);
+  g_signal_handlers_disconnect_by_func(
+      target->view, reinterpret_cast<gpointer>(on_focus_in_event), nullptr);
+  gtk_drag_dest_unset(target->view);
+  g_hash_table_remove(self->view_targets, &view_id);
+}
+
+static void attach_view(DesktopDropPlugin *self, gint64 view_id,
+                        GtkWidget *view) {
+  detach_view(self, view_id);
+
+  auto *target = g_new0(ViewTarget, 1);
+  target->plugin = self;
+  target->view_id = view_id;
+  target->view = view;
+  g_autofree gchar *name =
+      g_strdup_printf("desktop_drop/view/%" G_GINT64_FORMAT, view_id);
+  g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
+  target->channel =
+      fl_method_channel_new(self->messenger, name, FL_METHOD_CODEC(codec));
+  target->destroy_handler =
+      g_signal_connect(view, "destroy", G_CALLBACK(on_view_destroy), target);
+  g_hash_table_insert(self->view_targets, &target->view_id, target);
+
+  attach_drop_target(view, target->channel);
+}
+
+// Reads the int "viewId" (and "handle") of an attachView/detachView call.
+static gboolean read_view_args(FlMethodCall *method_call, gint64 *view_id,
+                               gint64 *handle) {
+  FlValue *args = fl_method_call_get_args(method_call);
+  if (fl_value_get_type(args) != FL_VALUE_TYPE_MAP) {
+    return FALSE;
+  }
+  FlValue *id = fl_value_lookup_string(args, "viewId");
+  if (id == nullptr || fl_value_get_type(id) != FL_VALUE_TYPE_INT) {
+    return FALSE;
+  }
+  *view_id = fl_value_get_int(id);
+  if (handle == nullptr) {
+    return TRUE;
+  }
+  FlValue *value = fl_value_lookup_string(args, "handle");
+  if (value == nullptr || fl_value_get_type(value) != FL_VALUE_TYPE_INT ||
+      fl_value_get_int(value) == 0) {
+    return FALSE;
+  }
+  *handle = fl_value_get_int(value);
+  return TRUE;
+}
+
 // Called when a method call is received from Flutter.
 static void desktop_drop_plugin_handle_method_call(
     DesktopDropPlugin *self,
     FlMethodCall *method_call) {
+  const gchar *method = fl_method_call_get_name(method_call);
+  gint64 view_id = 0;
+  gint64 handle = 0;
+  if (strcmp(method, "attachView") == 0) {
+    if (!read_view_args(method_call, &view_id, &handle)) {
+      fl_method_call_respond_error(method_call, "bad_args",
+                                   "attachView needs an int viewId and handle",
+                                   nullptr, nullptr);
+      return;
+    }
+    auto *view = reinterpret_cast<GtkWidget *>(handle);
+    if (!GTK_IS_WIDGET(view)) {
+      fl_method_call_respond_error(method_call, "bad_args",
+                                   "attachView handle is not an FlView",
+                                   nullptr, nullptr);
+      return;
+    }
+    attach_view(self, view_id, view);
+    fl_method_call_respond_success(method_call, nullptr, nullptr);
+    return;
+  }
+  if (strcmp(method, "detachView") == 0) {
+    if (!read_view_args(method_call, &view_id, nullptr)) {
+      fl_method_call_respond_error(method_call, "bad_args",
+                                   "detachView needs an int viewId", nullptr,
+                                   nullptr);
+      return;
+    }
+    detach_view(self, view_id);
+    fl_method_call_respond_success(method_call, nullptr, nullptr);
+    return;
+  }
   fl_method_call_respond_not_implemented(method_call, nullptr);
 }
 
 static void desktop_drop_plugin_dispose(GObject *object) {
+  DesktopDropPlugin *self = DESKTOP_DROP_PLUGIN(object);
+  if (self->view_targets != nullptr) {
+    GHashTableIter iter;
+    gpointer value;
+    g_hash_table_iter_init(&iter, self->view_targets);
+    while (g_hash_table_iter_next(&iter, nullptr, &value)) {
+      auto *target = static_cast<ViewTarget *>(value);
+      g_signal_handler_disconnect(target->view, target->destroy_handler);
+    }
+  }
+  g_clear_pointer(&self->view_targets, g_hash_table_unref);
+  g_clear_object(&self->messenger);
   G_OBJECT_CLASS(desktop_drop_plugin_parent_class)->dispose(object);
 }
 
@@ -84,6 +235,8 @@ static void desktop_drop_plugin_class_init(DesktopDropPluginClass *klass) {
 }
 
 static void desktop_drop_plugin_init(DesktopDropPlugin *self) {
+  self->view_targets = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                             nullptr, view_target_free);
   const char * desktopEnv = getenv("XDG_CURRENT_DESKTOP");
   if (desktopEnv) {
     const char * lowercaseDesktopEnv = g_ascii_strdown(desktopEnv, -1);
@@ -94,7 +247,8 @@ static void desktop_drop_plugin_init(DesktopDropPlugin *self) {
   }
 }
 
-static gboolean on_focus_in_event(GtkWidget *widget, GdkEventFocus *event, gpointer user_data) {
+static gboolean on_focus_in_event(GtkWidget *widget, GdkEventFocus *event,
+                                  gpointer user_data) {
   if (isKDE) {
     ignoreNext = TRUE;
   }
@@ -110,16 +264,8 @@ static void method_call_cb(FlMethodChannel *channel, FlMethodCall *method_call,
 void desktop_drop_plugin_register_with_registrar(FlPluginRegistrar *registrar) {
   DesktopDropPlugin *plugin = DESKTOP_DROP_PLUGIN(
       g_object_new(desktop_drop_plugin_get_type(), nullptr));
-
-  auto *fl_view = fl_plugin_registrar_get_view(registrar);
-  // Register portal file transfer target FIRST (highest priority)
-  // then STRING, then URI targets
-  static GtkTargetEntry entries[] = {
-      {strdup("application/vnd.portal.filetransfer"), GTK_TARGET_OTHER_APP, 0},
-      {strdup("STRING"), GTK_TARGET_OTHER_APP, 0}
-  };
-  gtk_drag_dest_set(GTK_WIDGET(fl_view), GTK_DEST_DEFAULT_ALL, entries, 2, GDK_ACTION_COPY);
-  gtk_drag_dest_add_uri_targets(GTK_WIDGET(fl_view));
+  plugin->messenger =
+      FL_BINARY_MESSENGER(g_object_ref(fl_plugin_registrar_get_messenger(registrar)));
 
   g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
   FlMethodChannel *channel =
@@ -130,14 +276,11 @@ void desktop_drop_plugin_register_with_registrar(FlPluginRegistrar *registrar) {
                                             g_object_ref(plugin),
                                             g_object_unref);
 
-  g_signal_connect(fl_view, "drag-motion",
-                   G_CALLBACK(on_drag_motion), channel);
-  g_signal_connect(GTK_WIDGET(fl_view), "drag-data-received",
-                   G_CALLBACK(on_drag_data_received), channel);
-  g_signal_connect(GTK_WIDGET(fl_view), "drag-leave",
-                   G_CALLBACK(on_drag_leave), channel);
-  g_signal_connect(fl_view, "focus-in-event",
-                   G_CALLBACK(on_focus_in_event), nullptr);
+  // A headless engine has no view; its app attaches windows with attachView.
+  FlView *fl_view = fl_plugin_registrar_get_view(registrar);
+  if (fl_view != nullptr) {
+    attach_drop_target(GTK_WIDGET(fl_view), channel);
+  }
 
   g_object_unref(plugin);
 }

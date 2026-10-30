@@ -48,10 +48,7 @@ class DropDoneDetails {
 }
 
 class DropEventDetails {
-  DropEventDetails({
-    required this.localPosition,
-    required this.globalPosition,
-  });
+  DropEventDetails({required this.localPosition, required this.globalPosition});
 
   final Offset localPosition;
 
@@ -100,11 +97,7 @@ class DropTarget extends StatefulWidget {
   State<DropTarget> createState() => _DropTargetState();
 }
 
-enum _DragTargetStatus {
-  enter,
-  update,
-  idle,
-}
+enum _DragTargetStatus { enter, update, idle }
 
 class _DropTargetState extends State<DropTarget> {
   _DragTargetStatus _status = _DragTargetStatus.idle;
@@ -136,6 +129,10 @@ class _DropTargetState extends State<DropTarget> {
   }
 
   void _onDropEvent(DropEvent event) {
+    // An event from an attached window belongs to that window's targets.
+    if (event.viewId != null && event.viewId != View.of(context).viewId) {
+      return;
+    }
     final renderBox = context.findRenderObject() as RenderBox?;
     if (renderBox == null) {
       return;
@@ -191,12 +188,14 @@ class _DropTargetState extends State<DropTarget> {
         globalLocation: globalPosition,
         localLocation: position,
       );
-      widget.onDragDone?.call(DropDoneDetails(
-        files: event.files,
-        localPosition: position,
-        globalPosition: globalPosition,
-        rawText: event.rawText,
-      ));
+      widget.onDragDone?.call(
+        DropDoneDetails(
+          files: event.files,
+          localPosition: position,
+          globalPosition: globalPosition,
+          rawText: event.rawText,
+        ),
+      );
     }
   }
 

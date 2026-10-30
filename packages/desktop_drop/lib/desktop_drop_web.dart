@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:web/web.dart' as web;
+
 import 'dart:js_interop';
 
 import 'package:flutter/cupertino.dart';
@@ -33,13 +34,16 @@ class DesktopDropWeb {
   // Calling it only once silently truncates directories with >100 files.
   // See: https://wicg.github.io/entries-api/#dom-filesystemdirectoryreader-readentries
   Future<List<dynamic>> _readAllEntries(
-      web.FileSystemDirectoryReader reader) async {
+    web.FileSystemDirectoryReader reader,
+  ) async {
     final allEntries = <dynamic>[];
     while (true) {
       final completer = Completer<List<dynamic>>();
-      reader.readEntries((JSArray<web.FileSystemEntry> batch) {
-        completer.complete(batch.toDart);
-      }.toJS);
+      reader.readEntries(
+        (JSArray<web.FileSystemEntry> batch) {
+          completer.complete(batch.toDart);
+        }.toJS,
+      );
       final batch = await completer.future;
       if (batch.isEmpty) break;
       allEntries.addAll(batch);
@@ -54,11 +58,11 @@ class DesktopDropWeb {
 
       final List<dynamic> entries = await _readAllEntries(reader);
 
-      final children = await Future.wait(
-        entries.map((e) => _entryToWebDropItem(e)),
-      )
-        ..removeWhere(
-            (element) => element.name == '.DS_Store' && element.type == '');
+      final children =
+          await Future.wait(entries.map((e) => _entryToWebDropItem(e)))
+            ..removeWhere(
+              (element) => element.name == '.DS_Store' && element.type == '',
+            );
 
       return WebDropItem(
         uri: web.URL.createObjectURL(web.Blob().slice(0, 0, 'directory')),
@@ -115,14 +119,16 @@ class DesktopDropWeb {
         entries.add(entry);
       }
 
-      Future.wait(entries.map(_entryToWebDropItem)).then((webItems) {
-        channel.invokeMethod(
-          "performOperation_web",
-          webItems.map((e) => e.toJson()).toList(),
-        );
-      }).catchError((e, s) {
-        debugPrint('desktop_drop_web: $e $s');
-      });
+      Future.wait(entries.map(_entryToWebDropItem))
+          .then((webItems) {
+            channel.invokeMethod(
+              "performOperation_web",
+              webItems.map((e) => e.toJson()).toList(),
+            );
+          })
+          .catchError((e, s) {
+            debugPrint('desktop_drop_web: $e $s');
+          });
     }.toJS);
 
     web.window.ondragenter = ((web.DragEvent event) {

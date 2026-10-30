@@ -4,7 +4,12 @@ import 'package:flutter/painting.dart';
 abstract class DropEvent {
   Offset location;
 
-  DropEvent(this.location);
+  /// The view the drag is over, for a window attached with
+  /// `DesktopDrop.attachView`; null for the plugin registrar's view, the
+  /// web page and Android, whose events reach every `DropTarget`.
+  final int? viewId;
+
+  DropEvent(this.location, {this.viewId});
 
   @override
   String toString() {
@@ -13,15 +18,15 @@ abstract class DropEvent {
 }
 
 class DropEnterEvent extends DropEvent {
-  DropEnterEvent({required Offset location}) : super(location);
+  DropEnterEvent({required Offset location, super.viewId}) : super(location);
 }
 
 class DropExitEvent extends DropEvent {
-  DropExitEvent({required Offset location}) : super(location);
+  DropExitEvent({required Offset location, super.viewId}) : super(location);
 }
 
 class DropUpdateEvent extends DropEvent {
-  DropUpdateEvent({required Offset location}) : super(location);
+  DropUpdateEvent({required Offset location, super.viewId}) : super(location);
 }
 
 class DropDoneEvent extends DropEvent {
@@ -59,6 +64,7 @@ class DropDoneEvent extends DropEvent {
     required Offset location,
     required this.files,
     this.rawText,
+    super.viewId,
   }) : super(location);
 
   @override
